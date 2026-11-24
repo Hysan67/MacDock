@@ -45,6 +45,23 @@ thread_local! {
     static RAISED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Pause widget updates and hide them during fullscreen games to keep idle CPU at 0%.
+pub fn set_paused(on: bool) {
+    STATE.with(|st| {
+        if let Some(w) = st.borrow().as_ref() {
+            unsafe {
+                if on {
+                    let _ = KillTimer(w.hwnd, TIMER_TICK);
+                    let _ = ShowWindow(w.hwnd, SW_HIDE);
+                } else {
+                    let _ = ShowWindow(w.hwnd, SW_SHOWNOACTIVATE);
+                    SetTimer(w.hwnd, TIMER_TICK, TICK_MS, None);
+                }
+            }
+        }
+    });
+}
+
 /// Follow the desktop up while show desktop is on, back to the bottom when it ends.
 pub fn set_raised(on: bool) {
     if RAISED.with(|r| r.replace(on)) == on {
@@ -153,11 +170,14 @@ impl Widgets {
         let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN) as u32, GetSystemMetrics(SM_CYSCREEN) as u32) };
         let n = self.size;
         let mut pm = Pixmap::new(n, n)?;
-        // only the part of the wallpaper under us, blurred hard (frosted like macOS widgets)
-        let full = gfx::wallpaper(sw, sh);
+        // Decode at half screen size (4× less peak RAM; it is heavily blurred right after anyway).
+        let (hw, hh) = ((sw / 2).max(1), (sh / 2).max(1));
+        let half = gfx::wallpaper(hw, hh);
         let mut under = Pixmap::new(n, n)?;
-        if let Some(full) = &full {
-            under.draw_pixmap(-self.pos.0, -self.pos.1, full.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        if let Some(half) = &half {
+            let (sx, sy) = (sw as f32 / half.width() as f32, sh as f32 / half.height() as f32);
+            let tf = Transform::from_scale(sx, sy).post_translate(-self.pos.0 as f32, -self.pos.1 as f32);
+            under.draw_pixmap(0, 0, half.as_ref(), &PixmapPaint { quality: tiny_skia::FilterQuality::Bilinear, ..Default::default() }, tf, None);
         } else {
             under.fill(Color::from_rgba8(0x40, 0x30, 0x28, 0xFF));
         }

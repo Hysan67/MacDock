@@ -22,14 +22,20 @@ fn endpoint() -> Option<IAudioEndpointVolume> {
     }
 }
 
-/// 0..1 (0 when muted), or None without an output device.
-pub fn volume() -> Option<f32> {
+/// (0..1 level, muted), or None without an output device.
+pub fn volume_state() -> Option<(f32, bool)> {
     let ep = endpoint()?;
     unsafe {
         let v = ep.GetMasterVolumeLevelScalar().ok()?;
         let muted = ep.GetMute().map(|b| b.as_bool()).unwrap_or(false);
-        Some(if muted { 0.0 } else { v })
+        Some((v, muted))
     }
+}
+
+/// 0..1 (0 when muted), or None without an output device.
+pub fn volume() -> Option<f32> {
+    let (v, muted) = volume_state()?;
+    Some(if muted { 0.0 } else { v })
 }
 
 pub fn set_volume(v: f32) {
@@ -64,8 +70,51 @@ fn first(svc: &IWbemServices, query: &str) -> Option<IWbemClassObject> {
     }
 }
 
+/// Fast built-in panel brightness read via \\.\LCD (no WMI overhead). None on desktop monitors.
+pub fn brightness_fast() -> Option<u8> {
+    use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
+    use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows::Win32::System::IO::DeviceIoControl;
+    const IOCTL_VIDEO_QUERY_DISPLAY_BRIGHTNESS: u32 = 0x0023_0498;
+    let mut buf = [0u8; 3];
+    let mut returned = 0u32;
+    unsafe {
+        let h = CreateFileW(
+            w!("\\\\.\\LCD"),
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            None,
+        )
+        .ok()?;
+        let ok = DeviceIoControl(
+            h,
+            IOCTL_VIDEO_QUERY_DISPLAY_BRIGHTNESS,
+            None,
+            0,
+            Some(buf.as_mut_ptr().cast()),
+            buf.len() as u32,
+            Some(&mut returned),
+            None,
+        )
+        .is_ok();
+        let _ = CloseHandle(h);
+        if !ok || returned < 3 {
+            return None;
+        }
+        // buf[0] = policy (1=AC, 2=DC, 3=both), buf[1] = AC brightness, buf[2] = DC brightness
+        let pct = if buf[0] == 2 { buf[2] } else { buf[1] };
+        Some(pct.min(100))
+    }
+}
+
 /// 0-100, or None (no WMI brightness: desktop monitor).
 pub fn brightness() -> Option<u8> {
+    if let Some(p) = brightness_fast() {
+        return Some(p);
+    }
     let svc = wmi()?;
     let o = first(&svc, "SELECT CurrentBrightness FROM WmiMonitorBrightness")?;
     unsafe {

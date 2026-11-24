@@ -364,6 +364,14 @@ pub fn rrect_shadow(x: f32, y: f32, w: f32, h: f32, r: f32, radius: f32, rgba: (
 /// Three box blurs ≈ a gaussian with sigma ≈ radius / 2. Works on premultiplied data, all four channels.
 /// `src` over `dst` at (x, y), premultiplied; opaque pixels are copied straight.
 pub fn blit_over(dst: &mut tiny_skia::PixmapMut, src: &Pixmap, x: i32, y: i32) {
+    blit_over_alpha(dst, src, x, y, 255);
+}
+
+/// `src` over `dst` at (x, y), premultiplied, scaled by `alpha` (0..=255).
+pub fn blit_over_alpha(dst: &mut tiny_skia::PixmapMut, src: &Pixmap, x: i32, y: i32, alpha: u8) {
+    if alpha == 0 {
+        return;
+    }
     let (dw, dh, sw, sh) = (dst.width() as i32, dst.height() as i32, src.width() as i32, src.height() as i32);
     let (x0, x1) = (x.max(0), (x + sw).min(dw));
     if x0 >= x1 {
@@ -378,7 +386,23 @@ pub fn blit_over(dst: &mut tiny_skia::PixmapMut, src: &Pixmap, x: i32, y: i32) {
         }
         let s = &sd[((sy * sw + (x0 - x)) * 4) as usize..((sy * sw + (x1 - x)) * 4) as usize];
         let d = &mut dd[((ty * dw + x0) * 4) as usize..((ty * dw + x1) * 4) as usize];
-        over_sparse(d, s);
+        if alpha == 255 {
+            over_sparse(d, s);
+        } else {
+            let af = alpha as u32;
+            for (dp, sp) in d.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+                let sa = (sp[3] as u32 * af + 127) / 255;
+                if sa == 0 {
+                    continue;
+                }
+                let k = 255 - sa;
+                for i in 0..3 {
+                    let sc = (sp[i] as u32 * af + 127) / 255;
+                    dp[i] = (sc + (dp[i] as u32 * k + 127) / 255) as u8;
+                }
+                dp[3] = (sa + (dp[3] as u32 * k + 127) / 255) as u8;
+            }
+        }
     }
 }
 

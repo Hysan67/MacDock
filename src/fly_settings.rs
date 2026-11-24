@@ -15,6 +15,7 @@ use crate::{push, Ev};
 pub enum Key {
     IconSize,
     Magnify,
+    GlassVisibility,
     AutoHide,
     Recents,
     Downloads,
@@ -24,9 +25,10 @@ pub enum Key {
     MenuBar,
     Widgets,
     Switcher,
+    WinKeyApps,
+    WinSearchSpotlight,
+    MediaHud,
     BatteryPct,
-    AiUsage,
-    ClaudeOAuth,
     TrayIcons,
     Genie,
     GenieMs,
@@ -58,7 +60,7 @@ const CHOICES: [Key; 2] = [Key::Language, Key::LaunchpadStyle];
 /// Write a change into a config. Returns false if nothing changed.
 pub fn apply(c: &mut Config, k: Key, v: f64) -> bool {
     let on = v >= 0.5;
-    let before = (c.icon_size, c.magnify, c.genie_ms, c.magnify_speed, c.hide_delay_ms, c.hide_speed);
+    let before = (c.icon_size, c.magnify, c.glass_visibility, c.genie_ms, c.magnify_speed, c.hide_delay_ms, c.hide_speed);
     let flag = match k {
         Key::IconSize => {
             c.icon_size = v.round().clamp(config::ICON_SIZE.0, config::ICON_SIZE.1);
@@ -66,6 +68,10 @@ pub fn apply(c: &mut Config, k: Key, v: f64) -> bool {
         }
         Key::Magnify => {
             c.magnify = ((v * 20.0).round() / 20.0).clamp(config::MAGNIFY.0, config::MAGNIFY.1);
+            None
+        }
+        Key::GlassVisibility => {
+            c.glass_visibility = ((v * 100.0).round() / 100.0).clamp(config::GLASS_VISIBILITY.0, config::GLASS_VISIBILITY.1);
             None
         }
         Key::GenieMs => {
@@ -105,9 +111,10 @@ pub fn apply(c: &mut Config, k: Key, v: f64) -> bool {
         Key::MenuBar => Some(&mut c.menu_bar),
         Key::Widgets => Some(&mut c.desktop_widgets),
         Key::Switcher => Some(&mut c.app_switcher),
+        Key::WinKeyApps => Some(&mut c.win_key_apps),
+        Key::WinSearchSpotlight => Some(&mut c.win_search_spotlight),
+        Key::MediaHud => Some(&mut c.media_hud),
         Key::BatteryPct => Some(&mut c.battery_percent),
-        Key::AiUsage => Some(&mut c.ai_usage),
-        Key::ClaudeOAuth => Some(&mut c.claude_usage_oauth),
         Key::TrayIcons => Some(&mut c.tray_icons),
         Key::Genie => Some(&mut c.genie),
         Key::ReduceMotion => Some(&mut c.reduce_motion),
@@ -118,7 +125,7 @@ pub fn apply(c: &mut Config, k: Key, v: f64) -> bool {
             *f = on;
             changed
         }
-        None => before != (c.icon_size, c.magnify, c.genie_ms, c.magnify_speed, c.hide_delay_ms, c.hide_speed),
+        None => before != (c.icon_size, c.magnify, c.glass_visibility, c.genie_ms, c.magnify_speed, c.hide_delay_ms, c.hide_speed),
     }
 }
 
@@ -133,12 +140,12 @@ pub fn reset_animations(c: &mut Config) {
 
 /// Set up once at start: a change only takes effect after a restart.
 fn needs_restart(k: Key) -> bool {
-    matches!(k, Key::MenuBar | Key::Widgets | Key::Switcher | Key::ClaudeOAuth)
+    matches!(k, Key::MenuBar | Key::Widgets | Key::Switcher)
 }
 
 /// The restart-only settings, in the order `Settings::started` keeps them.
-fn restart_state(c: &Config) -> [bool; 4] {
-    [c.menu_bar, c.desktop_widgets, c.app_switcher, c.claude_usage_oauth]
+fn restart_state(c: &Config) -> [bool; 3] {
+    [c.menu_bar, c.desktop_widgets, c.app_switcher]
 }
 
 enum Row {
@@ -172,6 +179,7 @@ fn dock_rows() -> Vec<Row> {
     vec![
         Row::Slider(Key::IconSize, "Size", 32.0, 96.0),
         Row::Slider(Key::Magnify, "Magnification", 1.0, 3.0),
+        Row::Slider(Key::GlassVisibility, "Liquid Glass visibility", config::GLASS_VISIBILITY.0, config::GLASS_VISIBILITY.1),
         Row::Switch(Key::AutoHide, "Automatically hide the dock"),
         Row::Switch(Key::Recents, "Show recent apps"),
         Row::Switch(Key::Downloads, "Show Downloads stack"),
@@ -186,10 +194,11 @@ fn desktop_rows() -> Vec<Row> {
         Row::Switch(Key::MenuBar, "Menu bar"),
         Row::Switch(Key::BatteryPct, "Battery percentage"),
         Row::Switch(Key::TrayIcons, "Tray icons in the menu bar"),
-        Row::Switch(Key::AiUsage, "AI usage in the menu bar"),
-        Row::Switch(Key::ClaudeOAuth, "Claude limits from your Claude login"),
         Row::Switch(Key::Widgets, "Desktop widgets"),
         Row::Switch(Key::Switcher, "Mac-style Alt+Tab"),
+        Row::Switch(Key::WinKeyApps, "Win key opens Apps"),
+        Row::Switch(Key::WinSearchSpotlight, "Win+S / Win+Q opens Spotlight"),
+        Row::Switch(Key::MediaHud, "Volume & brightness HUD"),
     ]
 }
 
@@ -212,7 +221,7 @@ fn general_rows() -> Vec<Row> {
 pub struct Settings {
     cfg: Config,
     /// the restart-only settings as this process started with them
-    started: [bool; 4],
+    started: [bool; 3],
 }
 
 impl Settings {
@@ -221,7 +230,7 @@ impl Settings {
     }
 
     /// The restart-only settings this process is actually running with.
-    pub fn set_started(&mut self, started: [bool; 4]) {
+    pub fn set_started(&mut self, started: [bool; 3]) {
         self.started = started;
     }
 
@@ -235,6 +244,7 @@ impl Settings {
         match k {
             Key::IconSize => c.icon_size,
             Key::Magnify => c.magnify,
+            Key::GlassVisibility => c.glass_visibility,
             Key::GenieMs => c.genie_ms,
             Key::MagnifySpeed => c.magnify_speed,
             Key::HideDelay => c.hide_delay_ms,
@@ -250,9 +260,10 @@ impl Settings {
             Key::MenuBar => b(c.menu_bar),
             Key::Widgets => b(c.desktop_widgets),
             Key::Switcher => b(c.app_switcher),
+            Key::WinKeyApps => b(c.win_key_apps),
+            Key::WinSearchSpotlight => b(c.win_search_spotlight),
+            Key::MediaHud => b(c.media_hud),
             Key::BatteryPct => b(c.battery_percent),
-            Key::AiUsage => b(c.ai_usage),
-            Key::ClaudeOAuth => b(c.claude_usage_oauth),
             Key::TrayIcons => b(c.tray_icons),
             Key::Genie => b(c.genie),
             Key::ReduceMotion => b(c.reduce_motion),
@@ -268,6 +279,13 @@ impl Settings {
                     t("Off").into()
                 } else {
                     format!("{v:.2}×")
+                }
+            }
+            Key::GlassVisibility => {
+                if v <= 0.001 {
+                    t("Off").into()
+                } else {
+                    format!("{:.0}%", v * 100.0)
                 }
             }
             Key::GenieMs | Key::HideDelay => format!("{:.2} s", v / 1000.0),
@@ -397,9 +415,9 @@ fn note_h(ui: &Ui, s: &str, w: f32) -> f32 {
     lines as f32 * ui.line_h(11.5, 400) + 16.0
 }
 
-const ALL: [Key; 23] = [
-    Key::IconSize, Key::Magnify, Key::AutoHide, Key::Recents, Key::Downloads, Key::Tiles, Key::Badges,
-    Key::HideTaskbar, Key::MenuBar, Key::Widgets, Key::Switcher, Key::BatteryPct, Key::AiUsage, Key::ClaudeOAuth,
+const ALL: [Key; 25] = [
+    Key::IconSize, Key::Magnify, Key::GlassVisibility, Key::AutoHide, Key::Recents, Key::Downloads, Key::Tiles, Key::Badges,
+    Key::HideTaskbar, Key::MenuBar, Key::Widgets, Key::Switcher, Key::WinKeyApps, Key::WinSearchSpotlight, Key::MediaHud, Key::BatteryPct,
     Key::TrayIcons, Key::Genie, Key::GenieMs, Key::MagnifySpeed, Key::HideDelay, Key::HideSpeed, Key::ReduceMotion,
     Key::Language, Key::LaunchpadStyle,
 ];
@@ -487,7 +505,7 @@ impl Content for Settings {
         let title = t("MacDock Settings");
         let tw = ui.text_w(title, 13.0, 600);
         ui.text_mid((cw - tw) / 2.0, TITLE_H / 2.0, title, 13.0, 600, white(0xD9), 0.0);
-        let ver = format!("v{}", crate::update::CURRENT);
+        let ver = format!("v{}", env!("CARGO_PKG_VERSION"));
         let vw = ui.text_w(&ver, 11.5, 400);
         ui.text_mid(cw - vw, TITLE_H / 2.0, &ver, 11.5, 400, white(0x66), 0.0);
         let top = TITLE_H + 16.0;
@@ -565,6 +583,10 @@ mod tests {
         assert_eq!(c.genie_ms, config::GENIE_MS.1);
         apply(&mut c, Key::IconSize, 47.6);
         assert_eq!(c.icon_size, 48.0);
+        assert!(apply(&mut c, Key::GlassVisibility, 0.456));
+        assert_eq!(c.glass_visibility, 0.46);
+        apply(&mut c, Key::GlassVisibility, -1.0);
+        assert_eq!(c.glass_visibility, 0.0);
         assert!(apply(&mut c, Key::Language, 2.0));
         assert_eq!(c.language, "id");
         c.reduce_motion = true;

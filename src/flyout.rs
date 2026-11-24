@@ -46,20 +46,9 @@ fn motion() -> bool {
 /// The blurred, dimmed wallpaper behind full-screen panels, kept for the next open (screen px).
 static BACKDROP: std::sync::Mutex<Option<std::sync::Arc<Pixmap>>> = std::sync::Mutex::new(None);
 
-/// The wallpaper changed: build the full-screen backdrop again next time it is needed.
+/// The wallpaper changed (or a full-screen panel closed): free the full-screen backdrop buffer.
 pub fn forget_backdrop() {
     *BACKDROP.lock().unwrap() = None;
-}
-
-/// Build the backdrop on a worker (decoding and blurring the wallpaper takes ~150 ms) so the Launchpad's first frame doesn't wait.
-pub fn warm_backdrop() {
-    std::thread::spawn(|| unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
-        let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
-        if sw > 0 && sh > 0 {
-            let _ = stage_backdrop(sw as u32, sh as u32);
-        }
-    });
 }
 
 /// The wallpaper at `w` x `h`, heavily blurred and dimmed like the macOS Launchpad background.
@@ -648,11 +637,15 @@ impl Flyout {
     }
 
     pub fn close(&mut self) {
+        let release_stage = self.stage;
         self.content.closing();
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_ANIM);
             if !motion() || IsIconic(self.hwnd).as_bool() {
                 let _ = DestroyWindow(self.hwnd);
+                if release_stage {
+                    forget_backdrop();
+                }
                 return;
             }
             // fade out like a macOS menu: clicks go through it meanwhile, and its own thread destroys it after
@@ -670,6 +663,9 @@ impl Flyout {
             }
             unsafe {
                 let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            if release_stage {
+                forget_backdrop();
             }
         });
     }

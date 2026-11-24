@@ -232,7 +232,7 @@ pub fn popup(owner: HWND, entries: &[Entry], at: Anchor, dpi: f64) -> Option<usi
         STATE.with(|s| *s.borrow_mut() = None);
         return None;
     };
-    let mut drawn_hover = Some(usize::MAX);
+    let mut drawn_hover = None;
     let mut result = None;
     unsafe {
         let draw = |surface: &mut Option<Surface>, hover: Option<usize>| {
@@ -246,7 +246,6 @@ pub fn popup(owner: HWND, entries: &[Entry], at: Anchor, dpi: f64) -> Option<usi
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(hwnd);
         SetCapture(hwnd);
-        drawn_hover = None;
         let mut msg = MSG::default();
         loop {
             if let Some(r) = with(|st| st.result).flatten() {

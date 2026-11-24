@@ -4,16 +4,12 @@
 
 #![windows_subsystem = "windows"]
 
-mod backdrop;
 mod badges;
 mod config;
 mod dock;
 mod dropfiles;
-mod ai_usage;
 mod apps;
 mod spotlight;
-mod claude_oauth;
-mod fly_ai;
 mod fly_battery;
 mod fly_cal;
 mod fly_cc;
@@ -26,6 +22,7 @@ mod genie;
 mod i18n;
 mod genie_gpu;
 mod gfx;
+mod hud;
 mod menu;
 mod menubar;
 mod power;
@@ -35,8 +32,8 @@ mod sysctl;
 mod taskbar;
 mod tile;
 mod tray;
-mod update;
 mod widgets;
+mod winhook;
 
 use std::cell::RefCell;
 
@@ -62,7 +59,9 @@ pub enum Ev {
     MinimizeStart(isize),
     MoveSizeEnd(isize),
     Settings(fly_settings::Change),
-    /// Alt+Space
+    /// Win key (Apps / Launchpad)
+    Apps,
+    /// Win+S / Win+Q
     Spotlight,
 }
 
@@ -109,8 +108,8 @@ struct App {
     /// the Settings window, which lives beside the drop-down flyouts
     win: Option<flyout::Flyout>,
     fullscreen: bool,
-    /// menu bar, widgets, Alt+Tab, Claude login as this process started them (changing them needs a restart)
-    started: [bool; 4],
+    /// menu bar, widgets, Alt+Tab as this process started them (changing them needs a restart)
+    started: [bool; 3],
 }
 
 impl App {
@@ -177,7 +176,9 @@ impl App {
             if let Some(g) = self.genie.as_mut() {
                 g.pause(on); // game mode: nothing of ours in the input path
             }
-            ai_usage::set_paused(on);
+            winhook::set_paused(on);
+            hud::set_paused(on);
+            widgets::set_paused(on);
             if let Some(b) = self.bar.as_mut() {
                 b.set_hidden(on);
             }
@@ -208,7 +209,6 @@ impl App {
             menubar::Extra::Wifi => Box::new(fly_wifi::WifiFly::new()),
             menubar::Extra::ControlCenter => Box::new(fly_cc::ControlCenter::new()),
             menubar::Extra::Tray => Box::new(fly_tray::TrayFly::new()),
-            menubar::Extra::Ai => Box::new(fly_ai::AiFly::new()),
             menubar::Extra::Calendar => Box::new(fly_cal::CalFly::new()),
             menubar::Extra::Settings => return self.open_settings(),
             menubar::Extra::Launchpad => self.all_apps(),
@@ -316,18 +316,18 @@ impl App {
                             taskbar::restore(false);
                         }
                     }
-                    Key::BatteryPct | Key::AiUsage | Key::TrayIcons => {
+                    Key::BatteryPct | Key::TrayIcons => {
                         let (o, on) = match k {
                             Key::BatteryPct => (menubar::BarOpt::BatteryPercent, c.battery_percent),
-                            Key::AiUsage => (menubar::BarOpt::AiUsage, c.ai_usage),
                             _ => (menubar::BarOpt::TrayIcons, c.tray_icons),
                         };
                         if let Some(b) = self.bar.as_mut() {
                             b.set_option(o, on);
                         }
-                        if k == Key::AiUsage && on && c.menu_bar {
-                            ai_usage::start(c.claude_limit_5h, c.claude_usage_oauth, || {});
-                        }
+                    }
+                    Key::WinKeyApps | Key::WinSearchSpotlight | Key::MediaHud => {
+                        winhook::set_options(c.win_key_apps, c.win_search_spotlight, c.media_hud);
+                        hud::set_enabled(c.media_hud);
                     }
                     _ => {}
                 }
@@ -393,16 +393,12 @@ impl App {
                     }
                     Some(menubar::BarAct::Fullscreen(on)) => self.set_fullscreen(on),
                     Some(menubar::BarAct::Option(o, on)) => {
-                        let c = self.dock.update_config(|c| match o {
+                        self.dock.update_config(|c| match o {
                             menubar::BarOpt::BatteryPercent => c.battery_percent = on,
-                            menubar::BarOpt::AiUsage => c.ai_usage = on,
                             menubar::BarOpt::TrayIcons => c.tray_icons = on,
                         });
-                        if o == menubar::BarOpt::AiUsage && on {
-                            ai_usage::start(c.claude_limit_5h, c.claude_usage_oauth, || {});
-                        }
                     }
-                    Some(menubar::BarAct::Flyout(kind, _, r)) => self.toggle_flyout(kind, r),
+                    Some(menubar::BarAct::Flyout(kind, r)) => self.toggle_flyout(kind, r),
                     Some(menubar::BarAct::OpenSettings) => self.open_settings(),
                     None => {}
                 }
@@ -434,6 +430,7 @@ impl App {
                 }
             }
             Ev::Settings(ch) => return self.on_settings(ch),
+            Ev::Apps => self.open_launchpad(),
             Ev::Spotlight => self.open_spotlight(),
             Ev::Genie(ge) => {
                 if let Some(g) = self.genie.as_mut() {
@@ -611,18 +608,13 @@ Copy macdock.exe to a normal folder (for example %LOCALAPPDATA%\\Programs\\MacDo
     let hwnd = dock::create_window();
     dropfiles::register(hwnd);
     let genie = cfg.genie.then(genie::Genie::new);
-    let bar = cfg.menu_bar.then(|| menubar::MenuBar::new(menubar::create_window(), cfg.tray_icons, cfg.ai_usage, cfg.battery_percent));
-    if cfg.menu_bar && cfg.ai_usage {
-        ai_usage::start(cfg.claude_limit_5h, cfg.claude_usage_oauth, || {});
-    }
+    let bar = cfg.menu_bar.then(|| menubar::MenuBar::new(menubar::create_window(), cfg.tray_icons, cfg.battery_percent));
     let want_widgets = cfg.desktop_widgets;
     let want_switcher = cfg.app_switcher;
-    let started = [cfg.menu_bar, want_widgets, want_switcher, cfg.claude_usage_oauth];
+    let (win_apps, win_spot, media_hud) = (cfg.win_key_apps, cfg.win_search_spotlight, cfg.media_hud);
+    let started = [cfg.menu_bar, want_widgets, want_switcher];
     let mut app = App { dock: Dock::new(hwnd, cfg), genie, bar, fly: None, win: None, fullscreen: false, started };
     app.apply_genie_timing();
-    if app.dock.config().launchpad_style == "classic" {
-        flyout::warm_backdrop(); // only the full-screen Launchpad draws over it (~8 MB at 1080p)
-    }
     if let Some(b) = app.bar.as_mut() {
         b.start(); // reserve the top strip before the dock measures the work area
     }
@@ -633,7 +625,8 @@ Copy macdock.exe to a normal folder (for example %LOCALAPPDATA%\\Programs\\MacDo
     if want_switcher {
         switcher::start();
     }
-    update::start();
+    hud::start(media_hud);
+    winhook::start(hwnd, win_apps, win_spot, media_hud);
     if std::env::args().any(|a| a == "--settings") {
         app.open_settings();
     }
@@ -646,9 +639,6 @@ Copy macdock.exe to a normal folder (for example %LOCALAPPDATA%\\Programs\\MacDo
         .collect();
 
     unsafe {
-        // Spotlight on Alt+Space (macOS has Cmd+Space; Win+Space is taken by the keyboard layouts)
-        use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_NOREPEAT, VK_SPACE};
-        let _ = RegisterHotKey(HWND::default(), 1, MOD_ALT | MOD_NOREPEAT, VK_SPACE.0 as u32);
         let mut msg = MSG::default();
         'run: loop {
             if !app.awake() {
@@ -656,18 +646,12 @@ Copy macdock.exe to a normal folder (for example %LOCALAPPDATA%\\Programs\\MacDo
                 if !GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
                     break;
                 }
-                if msg.message == WM_HOTKEY {
-                    push(Ev::Spotlight);
-                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
             while PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
                     break 'run;
-                }
-                if msg.message == WM_HOTKEY {
-                    push(Ev::Spotlight);
                 }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);

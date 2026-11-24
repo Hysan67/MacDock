@@ -57,22 +57,20 @@ pub enum BarAct {
     Fullscreen(bool),
     /// a menu bar setting was switched; the app saves it to config.json
     Option(BarOpt, bool),
-    /// open (or close, if it is the open one) a menu bar extra under the item spanning these screen px
-    Flyout(Extra, i32, i32),
+    /// open (or close, if it is the open one) a menu bar extra under the item ending at this screen px
+    Flyout(Extra, i32),
     OpenSettings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BarOpt {
     BatteryPercent,
-    AiUsage,
     TrayIcons,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Extra {
     Tray,
-    Ai,
     Battery,
     Wifi,
     ControlCenter,
@@ -100,7 +98,6 @@ enum Item {
     App,
     Menu(&'static str),
     Chevron,
-    Ai,
     Battery,
     Net,
     Apps,
@@ -206,13 +203,6 @@ fn confirm(owner: HWND, q: &str) -> bool {
     }
 }
 
-fn inform(owner: HWND, msg: &str) {
-    let t = shell::wide(msg);
-    unsafe {
-        MessageBoxW(owner, windows::core::PCWSTR(t.as_ptr()), w!("MacDock"), MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
-    }
-}
-
 const RUN_KEY: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 
 fn at_login() -> bool {
@@ -292,13 +282,10 @@ pub struct MenuBar {
     appbar: bool,
     hidden: bool,
     tray: bool,
-    ai: bool,
     battery_pct: bool,
-    ai_gen: u64,
-    ai_label: String,
-    ai_pct: Option<f64>,
-    ai_live: bool,
     surface: Option<Surface>,
+    pm_buf: Option<Pixmap>,      // reused scratch buffer to avoid ~1 MB alloc per hover
+    content_buf: Option<Pixmap>, // cached glyphs + shadow, rebuilt only when content changes
     dark_text: bool, // the wallpaper behind the bar is bright, so the content is drawn black
     slots: Vec<Slot>,
     hover: Option<usize>,
@@ -307,33 +294,32 @@ pub struct MenuBar {
     app_name: String,
     names: HashMap<u32, String>,
     clock: String,
-    update: bool, // a newer release is out: dot on the logo, item in its menu
     battery: Option<(u8, bool, bool)>,
     net: Net,
     ticks: u32,
     tracking: bool,
     dirty: bool,
+    content_dirty: bool,
     pub auto_hide_dock: bool,
 }
 
 impl MenuBar {
-    pub fn new(hwnd: HWND, tray: bool, ai: bool, battery_pct: bool) -> MenuBar {
+    pub fn new(hwnd: HWND, tray: bool, battery_pct: bool) -> MenuBar {
         let (sw, sh, dpi) = crate::dock::primary_screen();
         let b = power();
         let n = read_net();
         MenuBar {
             hwnd, shell: Shell::default(), dpi, screen_w: sw, screen_h: sh, appbar: false, hidden: false, tray, battery_pct,
-            ai, ai_gen: u64::MAX, ai_label: String::new(), ai_pct: None, ai_live: false,
-            surface: None, dark_text: false, slots: Vec::new(), hover: None, open: None, target: HWND::default(),
-            app_name: "File Explorer".into(), names: HashMap::new(), clock: clock_text(), update: false, battery: b, net: n,
-            ticks: 0, tracking: false, dirty: true, auto_hide_dock: false,
+            surface: None, pm_buf: None, content_buf: None, dark_text: false, slots: Vec::new(), hover: None, open: None, target: HWND::default(),
+            app_name: "File Explorer".into(), names: HashMap::new(), clock: clock_text(), battery: b, net: n,
+            ticks: 0, tracking: false, dirty: true, content_dirty: true, auto_hide_dock: false,
         }
     }
 
     pub fn start(&mut self) {
         self.load_frost();
         unsafe {
-            SetTimer(self.hwnd, TIMER_TICK, 1000, None);
+            SetTimer(self.hwnd, TIMER_TICK, 2000, None);
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
         self.place();
@@ -360,7 +346,10 @@ impl MenuBar {
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, self.px(sw), self.px(H), SWP_NOACTIVATE);
         }
         self.surface = None;
+        self.pm_buf = None;
+        self.content_buf = None;
         self.dirty = true;
+        self.content_dirty = true;
         if !self.hidden {
             self.reserve();
         }
@@ -412,11 +401,15 @@ impl MenuBar {
             if on {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
                 let _ = KillTimer(self.hwnd, TIMER_TICK);
+                self.surface = None;
+                self.pm_buf = None;
+                self.content_buf = None;
             } else {
-                SetTimer(self.hwnd, TIMER_TICK, 1000, None);
+                SetTimer(self.hwnd, TIMER_TICK, 2000, None);
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
                 self.tick(true);
                 self.dirty = true;
+                self.content_dirty = true;
                 self.render();
             }
         }
@@ -458,61 +451,33 @@ impl MenuBar {
         if name != self.app_name {
             self.app_name = name;
             self.dirty = true;
+            self.content_dirty = true;
             self.render();
         }
     }
 
-    /// Clock every second; battery too; the network every 5 s.
+    /// Clock and battery every 2 s; the network every 6 s.
     fn tick(&mut self, all: bool) {
-        self.ticks += 1;
+        self.ticks = self.ticks.wrapping_add(1);
         let c = clock_text();
         if c != self.clock {
             self.clock = c;
             self.dirty = true;
-        }
-        let u = crate::update::available().is_some();
-        if u != self.update {
-            self.update = u;
-            self.dirty = true;
+            self.content_dirty = true;
         }
         let b = power();
         if b != self.battery {
             self.battery = b;
             self.dirty = true;
+            self.content_dirty = true;
         }
-        if self.ai {
-            self.read_ai();
-        }
-        if all || self.ticks % 5 == 1 {
+        if all || self.ticks % 3 == 1 {
             let n = read_net();
             if n != self.net {
                 self.net = n;
                 self.dirty = true;
+                self.content_dirty = true;
             }
-        }
-    }
-
-    /// Pick up a new AI usage summary: ring = the limit closest to running out, text = burn rate while busy.
-    fn read_ai(&mut self) {
-        let g = crate::ai_usage::generation();
-        if g == self.ai_gen {
-            return;
-        }
-        self.ai_gen = g;
-        let Some(s) = crate::ai_usage::summary() else { return };
-        let r = s.rate5();
-        let pct = s.worst_pct();
-        let label = if r > 0.0 {
-            format!("{}/s", crate::ai_usage::compact(r))
-        } else {
-            pct.map(|p| format!("{p:.0}%")).unwrap_or_default()
-        };
-        let live = s.providers().next().is_some();
-        if label != self.ai_label || pct != self.ai_pct || live != self.ai_live {
-            self.ai_label = label;
-            self.ai_pct = pct;
-            self.ai_live = live;
-            self.dirty = true;
         }
     }
 
@@ -583,6 +548,7 @@ impl MenuBar {
     /// Draw again from scratch (the interface language changed).
     pub fn redraw(&mut self) {
         self.dirty = true;
+        self.content_dirty = true;
         self.render();
     }
 
@@ -590,17 +556,14 @@ impl MenuBar {
     pub fn set_option(&mut self, o: BarOpt, on: bool) {
         let f = match o {
             BarOpt::BatteryPercent => &mut self.battery_pct,
-            BarOpt::AiUsage => &mut self.ai,
             BarOpt::TrayIcons => &mut self.tray,
         };
         if *f == on {
             return;
         }
         *f = on;
-        if o == BarOpt::AiUsage && on {
-            self.ai_gen = u64::MAX;
-        }
         self.dirty = true;
+        self.content_dirty = true;
         self.render();
     }
 
@@ -608,7 +571,7 @@ impl MenuBar {
     pub fn set_open_extra(&mut self, e: Option<Extra>) {
         let want = e.and_then(|e| {
             self.slots.iter().position(|s| {
-                matches!((s.item, e), (Item::Chevron, Extra::Tray) | (Item::Ai, Extra::Ai) | (Item::Battery, Extra::Battery) | (Item::Net, Extra::Wifi) | (Item::Cc, Extra::ControlCenter) | (Item::Clock, Extra::Calendar) | (Item::Apps, Extra::Launchpad) | (Item::Search, Extra::Spotlight))
+                matches!((s.item, e), (Item::Chevron, Extra::Tray) | (Item::Battery, Extra::Battery) | (Item::Net, Extra::Wifi) | (Item::Cc, Extra::ControlCenter) | (Item::Clock, Extra::Calendar) | (Item::Apps, Extra::Launchpad) | (Item::Search, Extra::Spotlight))
             })
         });
         if want != self.open {
@@ -622,7 +585,6 @@ impl MenuBar {
     pub fn extra_span(&self, e: Extra) -> Option<(i32, i32)> {
         let item = match e {
             Extra::Tray => Item::Chevron,
-            Extra::Ai => Item::Ai,
             Extra::Battery => Item::Battery,
             Extra::Wifi => Item::Net,
             Extra::ControlCenter => Item::Cc,
@@ -649,17 +611,16 @@ impl MenuBar {
 
     fn click(&mut self, i: usize) -> Option<BarAct> {
         let s = &self.slots[i];
-        let (l, r) = (self.px(s.x), self.px(s.x + s.w));
+        let r = self.px(s.x + s.w);
         match s.item {
             Item::Logo | Item::App | Item::Menu(_) => return self.show_menu(i),
-            Item::Chevron => return Some(BarAct::Flyout(Extra::Tray, l, r)),
-            Item::Ai => return Some(BarAct::Flyout(Extra::Ai, l, r)),
-            Item::Battery => return Some(BarAct::Flyout(Extra::Battery, l, r)),
-            Item::Net => return Some(BarAct::Flyout(Extra::Wifi, l, r)),
-            Item::Cc => return Some(BarAct::Flyout(Extra::ControlCenter, l, r)),
-            Item::Search => return Some(BarAct::Flyout(Extra::Spotlight, l, r)),
-            Item::Apps => return Some(BarAct::Flyout(Extra::Launchpad, l, r)),
-            Item::Clock => return Some(BarAct::Flyout(Extra::Calendar, l, r)),
+            Item::Chevron => return Some(BarAct::Flyout(Extra::Tray, r)),
+            Item::Battery => return Some(BarAct::Flyout(Extra::Battery, r)),
+            Item::Net => return Some(BarAct::Flyout(Extra::Wifi, r)),
+            Item::Cc => return Some(BarAct::Flyout(Extra::ControlCenter, r)),
+            Item::Search => return Some(BarAct::Flyout(Extra::Spotlight, r)),
+            Item::Apps => return Some(BarAct::Flyout(Extra::Launchpad, r)),
+            Item::Clock => return Some(BarAct::Flyout(Extra::Calendar, r)),
         }
     }
 
@@ -738,10 +699,6 @@ impl MenuBar {
     fn system_menu(&self) -> (Vec<Entry>, Vec<Do>) {
         split(vec![
             (Entry::item("About This PC"), Do::Launch("ms-settings:about")),
-            match crate::update::available() {
-                Some((v, _)) => (Entry::item(crate::i18n::fill("Update Available: MacDock {}…", &v.to_string())), Do::OpenUpdate),
-                None => (Entry::item("Check for MacDock Updates…"), Do::CheckUpdate),
-            },
             (Entry::Sep, Do::None),
             (Entry::item("System Settings…"), Do::Launch("ms-settings:")),
             (Entry::item("Microsoft Store…"), Do::Launch("ms-windows-store:")),
@@ -755,7 +712,6 @@ impl MenuBar {
             (Entry::item("Lock Screen").gesture("Win+L"), Do::Lock),
             (Entry::Sep, Do::None),
             (Entry::item("Show Battery Percentage").checked(self.battery_pct), Do::Opt(BarOpt::BatteryPercent)),
-            (Entry::item("Show AI Usage").checked(self.ai), Do::Opt(BarOpt::AiUsage)),
             (Entry::item("Show Tray Icons").checked(self.tray), Do::Opt(BarOpt::TrayIcons)),
             (Entry::Sep, Do::None),
             (Entry::item("Automatically Hide Dock").checked(self.auto_hide_dock), Do::AutoHide),
@@ -833,42 +789,17 @@ impl MenuBar {
             Do::Opt(o) => {
                 let f = match o {
                     BarOpt::BatteryPercent => &mut self.battery_pct,
-                    BarOpt::AiUsage => &mut self.ai,
                     BarOpt::TrayIcons => &mut self.tray,
                 };
                 *f = !*f;
                 let on = *f;
-                if o == BarOpt::AiUsage && on {
-                    self.ai_gen = u64::MAX; // read the summary again on the next tick
-                }
                 self.dirty = true;
+                self.content_dirty = true;
                 self.render();
                 return Some(BarAct::Option(o, on));
             }
             Do::Login => toggle_login(),
             Do::Settings => return Some(BarAct::OpenSettings),
-            Do::OpenUpdate => {
-                if let Some((_, url)) = crate::update::available() {
-                    shell::launch(&url);
-                }
-            }
-            Do::CheckUpdate => {
-                let cur = crate::update::CURRENT;
-                match crate::update::check() {
-                    Ok(Some((v, url))) => {
-                        if confirm(self.hwnd, &format!("MacDock {v} is available (you have {cur}).
-
-Open the download page?")) {
-                            shell::launch(&url);
-                        }
-                    }
-                    Ok(None) => inform(self.hwnd, &format!("MacDock {cur} is the latest version.")),
-                    Err(e) => inform(self.hwnd, &format!("Could not check for updates: {e}.")),
-                }
-                self.update = crate::update::available().is_some();
-                self.dirty = true;
-                self.render();
-            }
             Do::Quit => return Some(BarAct::Quit),
         }
         None
@@ -903,7 +834,6 @@ Open the download page?")) {
             Item::App => self.text_w(&self.app_name, self.font(700)),
             Item::Menu(m) => self.text_w(crate::i18n::t(m), self.font(500)),
             Item::Chevron => self.text_w("\u{E70E}", self.glyph_font(11.0)),
-            Item::Ai => 14.0 + if self.ai_label.is_empty() { 0.0 } else { 5.0 + self.text_w(&self.ai_label, self.font(400)) },
             Item::Battery => {
                 let t = self.battery_text();
                 if t.is_empty() { 26.0 } else { self.text_w(&t, self.font(400)) + 6.0 + 26.0 }
@@ -928,9 +858,6 @@ Open the download page?")) {
         if self.tray {
             right.push(Item::Chevron);
         }
-        if self.ai && self.ai_live {
-            right.push(Item::Ai);
-        }
         if self.battery.is_some() {
             right.push(Item::Battery);
         }
@@ -950,17 +877,76 @@ Open the download page?")) {
             return;
         }
         self.dirty = false;
-        self.layout();
         let (w, h) = (self.px(self.screen_w).max(1) as u32, self.px(H).max(1) as u32);
         if self.surface.as_ref().is_none_or(|s| s.w != w || s.h != h) {
             self.surface = Surface::new(w, h);
+            self.pm_buf = None;
+            self.content_buf = None;
+            self.content_dirty = true;
         }
         let dpi = self.dpi as f32;
-        let mut pm = Pixmap::new(w, h).unwrap();
+
+        // Rebuild the text/icon + shadow layer only when content actually changed (NOT on hover).
+        if self.content_dirty || self.content_buf.is_none() {
+            self.content_dirty = false;
+            self.layout();
+            let mut content = Pixmap::new(w, h).unwrap();
+            for s in &self.slots {
+                let cx = (s.x + PAD_X) as f32 * dpi;
+                let mid = H as f32 / 2.0 * dpi;
+                match s.item {
+                    Item::Logo => draw_logo(&mut content, cx, mid, dpi),
+                    Item::App => self.draw_text(&mut content, &self.app_name, self.font(700), cx, mid),
+                    Item::Menu(m) => self.draw_text(&mut content, crate::i18n::t(m), self.font(500), cx, mid),
+                    Item::Chevron => self.draw_text(&mut content, "\u{E70E}", self.glyph_font(11.0), cx, mid),
+                    Item::Battery => {
+                        let t = self.battery_text();
+                        self.draw_text(&mut content, &t, self.font(400), cx, mid);
+                        let gx = if t.is_empty() { cx } else { cx + (self.text_w(&t, self.font(400)) as f32 + 6.0) * dpi };
+                        if let Some((pct, ac, charging)) = self.battery {
+                            draw_battery(&mut content, gx, mid - 6.25 * dpi + 1.0 * dpi, 26.0 * dpi, 12.5 * dpi, pct, ac, charging);
+                        }
+                    }
+                    Item::Net => match self.net {
+                        Net::Wired => self.draw_text(&mut content, "\u{E839}", self.glyph_font(GLYPH_PX), cx, mid),
+                        Net::Wifi(b) => draw_wifi(&mut content, cx, mid - 6.25 * dpi, 17.0 * dpi, 12.5 * dpi, b, false),
+                        Net::Off => draw_wifi(&mut content, cx, mid - 6.25 * dpi, 17.0 * dpi, 12.5 * dpi, 0, true),
+                    },
+                    Item::Search => self.draw_text(&mut content, "\u{E721}", self.glyph_font(GLYPH_PX), cx, mid),
+                    Item::Apps => self.draw_text(&mut content, "\u{F0E2}", self.glyph_font(GLYPH_PX), cx, mid),
+                    Item::Cc => draw_cc(&mut content, cx, mid, dpi),
+                    Item::Clock => self.draw_text(&mut content, &self.clock, self.font(400), cx, mid),
+                }
+            }
+            if self.dark_text {
+                for px in content.pixels_mut() {
+                    let (r, g, b) = (px.red(), px.green(), px.blue());
+                    if r.max(g).max(b) - r.min(g).min(b) < 24 {
+                        *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, px.alpha()).unwrap();
+                    }
+                }
+                self.content_buf = Some(content);
+            } else {
+                let mut layer = Pixmap::new(w, h).unwrap();
+                let mut shadow = content.clone();
+                for px in shadow.pixels_mut() {
+                    *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, (px.alpha() as u16 * 110 / 255) as u8).unwrap();
+                }
+                gfx::blur(&mut shadow, 2.0 * dpi);
+                layer.draw_pixmap(0, (0.5 * dpi).round() as i32, shadow.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+                layer.draw_pixmap(0, 0, content.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+                self.content_buf = Some(layer);
+            }
+        }
+
+        // Reuse the scratch buffer so hover changes allocate zero memory.
+        if self.pm_buf.as_ref().is_none_or(|p| p.width() != w || p.height() != h) {
+            self.pm_buf = Pixmap::new(w, h);
+        }
+        let Some(pm) = self.pm_buf.as_mut() else { return };
         // macOS 26: no bar at all, the content sits on the wallpaper. The bar's own pixels stay at alpha 1 so
         // the whole strip still takes clicks; hover / open highlights go on that layer, under the content.
         pm.fill(Color::from_rgba8(0, 0, 0, 1));
-        let mut content = Pixmap::new(w, h).unwrap();
         for (i, s) in self.slots.iter().enumerate() {
             let lit = if self.open == Some(i) { 0x40 } else if self.hover == Some(i) { 0x30 } else { 0 };
             if lit > 0 {
@@ -975,67 +961,10 @@ Open the download page?")) {
                     pm.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
                 }
             }
-            let cx = (s.x + PAD_X) as f32 * dpi; // content left
-            let mid = H as f32 / 2.0 * dpi;
-            match s.item {
-                Item::Logo => {
-                    draw_logo(&mut content, cx, mid, dpi);
-                    if self.update {
-                        // update available: a small blue dot on the logo's top-right corner, like a badge
-                        if let Some(p) = tiny_skia::PathBuilder::from_circle(cx + 13.0 * dpi, mid - 6.5 * dpi, 3.2 * dpi) {
-                            let mut paint = Paint::default();
-                            paint.set_color_rgba8(0xFF, 0x84, 0x0A, 0xFF); // BGRA: #0A84FF
-                            paint.anti_alias = true;
-                            content.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
-                        }
-                    }
-                }
-                Item::App => self.draw_text(&mut content, &self.app_name, self.font(700), cx, mid),
-                Item::Menu(m) => self.draw_text(&mut content, crate::i18n::t(m), self.font(500), cx, mid),
-                Item::Chevron => self.draw_text(&mut content, "\u{E70E}", self.glyph_font(11.0), cx, mid),
-                Item::Ai => {
-                    draw_ai_ring(&mut content, cx + 7.0 * dpi, mid, 6.0 * dpi, dpi, self.ai_pct, self.ai_label.ends_with("/s"));
-                    if !self.ai_label.is_empty() {
-                        self.draw_text(&mut content, &self.ai_label, self.font(400), cx + 19.0 * dpi, mid);
-                    }
-                }
-                Item::Battery => {
-                    let t = self.battery_text();
-                    self.draw_text(&mut content, &t, self.font(400), cx, mid);
-                    let gx = if t.is_empty() { cx } else { cx + (self.text_w(&t, self.font(400)) as f32 + 6.0) * dpi };
-                    if let Some((pct, ac, charging)) = self.battery {
-                        draw_battery(&mut content, gx, mid - 6.25 * dpi + 1.0 * dpi, 26.0 * dpi, 12.5 * dpi, pct, ac, charging);
-                    }
-                }
-                Item::Net => match self.net {
-                    Net::Wired => self.draw_text(&mut content, "\u{E839}", self.glyph_font(GLYPH_PX), cx, mid),
-                    Net::Wifi(b) => draw_wifi(&mut content, cx, mid - 6.25 * dpi, 17.0 * dpi, 12.5 * dpi, b, false),
-                    Net::Off => draw_wifi(&mut content, cx, mid - 6.25 * dpi, 17.0 * dpi, 12.5 * dpi, 0, true),
-                },
-                Item::Search => self.draw_text(&mut content, "\u{E721}", self.glyph_font(GLYPH_PX), cx, mid),
-                Item::Apps => self.draw_text(&mut content, "\u{F0E2}", self.glyph_font(GLYPH_PX), cx, mid),
-                Item::Cc => draw_cc(&mut content, cx, mid, dpi),
-                Item::Clock => self.draw_text(&mut content, &self.clock, self.font(400), cx, mid),
-            }
         }
-        if self.dark_text {
-            // bright wallpaper: the white glyphs turn black (coloured ones, like a charging battery, stay)
-            for px in content.pixels_mut() {
-                let (r, g, b) = (px.red(), px.green(), px.blue());
-                if r.max(g).max(b) - r.min(g).min(b) < 24 {
-                    *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, px.alpha()).unwrap();
-                }
-            }
-        } else {
-            // dark wallpaper: white content with a soft shadow, like macOS
-            let mut shadow = content.clone();
-            for px in shadow.pixels_mut() {
-                *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, (px.alpha() as u16 * 110 / 255) as u8).unwrap();
-            }
-            gfx::blur(&mut shadow, 2.0 * dpi);
-            pm.draw_pixmap(0, (0.5 * dpi).round() as i32, shadow.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        if let Some(layer) = &self.content_buf {
+            gfx::over_sparse(pm.data_mut(), layer.data());
         }
-        pm.draw_pixmap(0, 0, content.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
         if let Some(sf) = self.surface.as_mut() {
             // replace, not blend: the surface still holds the last frame
             let copy = PixmapPaint { blend_mode: tiny_skia::BlendMode::Source, ..Default::default() };
@@ -1056,6 +985,7 @@ Open the download page?")) {
             self.dark_text = n > 0 && sum / n as f64 / 255.0 > 0.62;
         }
         self.dirty = true;
+        self.content_dirty = true;
     }
 
     fn draw_text(&self, pm: &mut Pixmap, s: &str, f: Font, x: f32, mid: f32) {
@@ -1085,8 +1015,6 @@ enum Do {
     Opt(BarOpt),
     Login,
     Settings,
-    OpenUpdate,
-    CheckUpdate,
     Quit,
 }
 
@@ -1155,42 +1083,6 @@ pub fn draw_wifi(pm: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, bars: u8, off:
     let dot = (h * 0.12).max(1.2);
     if let Some(c) = PathBuilder::from_circle(cx, cy - dot, dot) {
         pm.fill_path(&c, &white(if !off && bars >= 1 { 255 } else { 0x4D }), FillRule::Winding, Transform::identity(), None);
-    }
-}
-
-/// AI usage: a ring filled to the worst limit's percentage (colour by level), a dot in the middle while tokens burn.
-fn draw_ai_ring(pm: &mut Pixmap, cx: f32, cy: f32, r: f32, dpi: f32, pct: Option<f64>, live: bool) {
-    let sw = 1.9 * dpi;
-    let ring = |pm: &mut Pixmap, from: f32, to: f32, paint: &Paint| {
-        let mut pb = PathBuilder::new();
-        let n = ((to - from) / 0.12).ceil().max(2.0) as usize;
-        for i in 0..=n {
-            let t = from + (to - from) * i as f32 / n as f32;
-            let (x, y) = (cx + r * t.sin(), cy - r * t.cos());
-            if i == 0 {
-                pb.move_to(x, y);
-            } else {
-                pb.line_to(x, y);
-            }
-        }
-        if let Some(p) = pb.finish() {
-            let st = Stroke { width: sw, line_cap: tiny_skia::LineCap::Round, ..Default::default() };
-            pm.stroke_path(&p, paint, &st, Transform::identity(), None);
-        }
-    };
-    let tau = std::f32::consts::TAU;
-    ring(pm, 0.0, tau, &white(0x55));
-    if let Some(p) = pct.filter(|p| *p > 0.0) {
-        let (r_, g, b) = crate::fly_ai::level(p);
-        let mut paint = Paint::default();
-        paint.set_color_rgba8(b, g, r_, 255); // surfaces are BGRA
-        paint.anti_alias = true;
-        ring(pm, 0.0, tau * (p.min(100.0) / 100.0) as f32, &paint);
-    }
-    if live {
-        if let Some(c) = PathBuilder::from_circle(cx, cy, 2.2 * dpi) {
-            pm.fill_path(&c, &white(0xF0), FillRule::Winding, Transform::identity(), None);
-        }
     }
 }
 

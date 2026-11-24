@@ -7,6 +7,8 @@ pub struct Config {
     pub pinned: Vec<String>,
     pub icon_size: f64,
     pub magnify: f64,
+    /// Visibility (opacity) of the dock's Liquid Glass plate (0.0 = hidden, 1.0 = full).
+    pub glass_visibility: f64,
     pub hide_taskbar: bool,
     pub menu_bar: bool,
     pub genie: bool,
@@ -18,12 +20,6 @@ pub struct Config {
     pub badges: bool,
     /// Host the notification-area icons behind a ^ item in the menu bar.
     pub tray_icons: bool,
-    /// Claude Code / Codex token burn and limits in the menu bar, read from their local logs.
-    pub ai_usage: bool,
-    /// Tokens per 5-hour Claude block that count as 100% (Claude Code logs no limit itself). None = no %.
-    pub claude_limit_5h: Option<u64>,
-    /// Ask Anthropic's usage endpoint (with Claude Code's own login) for Claude's real 5-hour / weekly limits.
-    pub claude_usage_oauth: bool,
     /// Dock item key → image or exe the user picked as its icon (right-click → Change Icon…).
     pub icon_overrides: Map<String, Value>,
     /// Up to 3 apps that ran unpinned and quit, newest first, shown after a divider like macOS
@@ -38,6 +34,12 @@ pub struct Config {
     pub desktop_widgets: bool,
     /// macOS-style Alt+Tab: one icon per app in a frosted panel (replaces the Windows switcher).
     pub app_switcher: bool,
+    /// Tapping the Windows key opens MacDock's Apps / Launchpad instead of the Start Menu.
+    pub win_key_apps: bool,
+    /// Win+S / Win+Q opens MacDock's Spotlight instead of Windows Search.
+    pub win_search_spotlight: bool,
+    /// Show a macOS-style translucent HUD when Volume or Brightness changes.
+    pub media_hud: bool,
     /// How long the Genie minimize takes, in ms (restoring takes a little less).
     pub genie_ms: f64,
     /// Multiplier on how fast icons grow and shrink under the pointer.
@@ -59,6 +61,7 @@ pub struct Config {
 /// Allowed ranges (min, max) of the numeric settings.
 pub const ICON_SIZE: (f64, f64) = (16.0, 128.0);
 pub const MAGNIFY: (f64, f64) = (1.0, 3.0);
+pub const GLASS_VISIBILITY: (f64, f64) = (0.0, 1.0);
 pub const GENIE_MS: (f64, f64) = (150.0, 1500.0);
 pub const HIDE_DELAY_MS: (f64, f64) = (0.0, 2000.0);
 pub const SPEED: (f64, f64) = (0.25, 4.0);
@@ -109,6 +112,7 @@ impl Default for Config {
             .collect(),
             icon_size: 52.0,
             magnify: 1.75,
+            glass_visibility: 1.0,
             hide_taskbar: true,
             menu_bar: true,
             genie: true,
@@ -116,15 +120,15 @@ impl Default for Config {
             auto_hide: false,
             badges: true,
             tray_icons: true,
-            ai_usage: true,
-            claude_limit_5h: None,
-            claude_usage_oauth: false,
             icon_overrides: Map::new(),
             recent: Vec::new(),
             show_recents: true,
             downloads_stack: true,
             desktop_widgets: true,
             app_switcher: true,
+            win_key_apps: true,
+            win_search_spotlight: true,
+            media_hud: true,
             battery_percent: false,
             genie_ms: 560.0,
             magnify_speed: 1.0,
@@ -158,13 +162,14 @@ impl Config {
         b("AutoHide", &mut c.auto_hide);
         b("Badges", &mut c.badges);
         b("TrayIcons", &mut c.tray_icons);
-        b("AiUsage", &mut c.ai_usage);
-        b("ClaudeUsageOAuth", &mut c.claude_usage_oauth);
         b("ShowRecents", &mut c.show_recents);
         b("DownloadsStack", &mut c.downloads_stack);
         b("BatteryPercent", &mut c.battery_percent);
         b("DesktopWidgets", &mut c.desktop_widgets);
         b("AppSwitcher", &mut c.app_switcher);
+        b("WinKeyApps", &mut c.win_key_apps);
+        b("WinSearchSpotlight", &mut c.win_search_spotlight);
+        b("MediaHud", &mut c.media_hud);
         b("ReduceMotion", &mut c.reduce_motion);
         let mut f = |k: &str, d: &mut f64, lo: f64, hi: f64| {
             if let Some(x) = v.remove(k).and_then(|x| x.as_f64()) {
@@ -175,6 +180,7 @@ impl Config {
         f("MagnifySpeed", &mut c.magnify_speed, SPEED.0, SPEED.1);
         f("AutoHideDelay", &mut c.hide_delay_ms, HIDE_DELAY_MS.0, HIDE_DELAY_MS.1);
         f("AutoHideSpeed", &mut c.hide_speed, SPEED.0, SPEED.1);
+        f("GlassVisibility", &mut c.glass_visibility, GLASS_VISIBILITY.0, GLASS_VISIBILITY.1);
         if let Some(l) = v.remove("Language").and_then(|x| x.as_str().map(String::from)) {
             if ["auto", "en", "id"].contains(&l.as_str()) {
                 c.language = l;
@@ -188,7 +194,6 @@ impl Config {
         if let Some(Value::Array(r)) = v.remove("Recent") {
             c.recent = r.into_iter().filter(|x| x.get("Key").and_then(|k| k.as_str()).is_some()).collect();
         }
-        c.claude_limit_5h = v.remove("ClaudeLimit5h").and_then(|x| x.as_u64()).filter(|x| *x > 0);
         if let Some(Value::Object(o)) = v.remove("IconOverrides") {
             c.icon_overrides = o;
         }
@@ -225,6 +230,7 @@ impl Config {
             "Pinned": self.pinned,
             "IconSize": self.icon_size,
             "Magnify": self.magnify,
+            "GlassVisibility": self.glass_visibility,
             "HideTaskbar": self.hide_taskbar,
             "MenuBar": self.menu_bar,
             "Genie": self.genie,
@@ -232,9 +238,6 @@ impl Config {
             "AutoHide": self.auto_hide,
             "Badges": self.badges,
             "TrayIcons": self.tray_icons,
-            "AiUsage": self.ai_usage,
-            "ClaudeLimit5h": self.claude_limit_5h,
-            "ClaudeUsageOAuth": self.claude_usage_oauth,
             "IconOverrides": self.icon_overrides,
             "Recent": self.recent,
             "ShowRecents": self.show_recents,
@@ -242,6 +245,9 @@ impl Config {
             "BatteryPercent": self.battery_percent,
             "DesktopWidgets": self.desktop_widgets,
             "AppSwitcher": self.app_switcher,
+            "WinKeyApps": self.win_key_apps,
+            "WinSearchSpotlight": self.win_search_spotlight,
+            "MediaHud": self.media_hud,
             "GenieDuration": self.genie_ms,
             "MagnifySpeed": self.magnify_speed,
             "AutoHideDelay": self.hide_delay_ms,
