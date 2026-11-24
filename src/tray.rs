@@ -50,10 +50,30 @@ fn taskbar_created() -> u32 {
     unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) }
 }
 
-/// Ask every app to (re-)add its icons to whichever Shell_TrayWnd is on top now.
+/// Ask tray-owning apps to (re-)add their icons to whichever Shell_TrayWnd is on top now,
+/// skipping live wallpaper apps (Lively Wallpaper, Wallpaper Engine) which treat repeated
+/// TaskbarCreated broadcasts as an Explorer crash loop and terminate wallpapers.
 fn broadcast() {
+    const SKIP: [&str; 6] = [
+        "Lively.exe", "Lively.UI.WinUI.exe", "Lively.PlayerCefSharp.exe", "Lively.PlayerWebView2.exe",
+        "wallpaper32.exe", "wallpaper64.exe",
+    ];
+    unsafe extern "system" fn send_each(h: HWND, l: LPARAM) -> windows::Win32::Foundation::BOOL {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, Some(&mut pid));
+        if pid != 0 {
+            if let Some(exe) = crate::shell::exe_name(pid) {
+                if SKIP.iter().any(|s| crate::shell::eq_ic(s, &exe)) {
+                    return true.into();
+                }
+            }
+        }
+        let _ = SendNotifyMessageW(h, l.0 as u32, WPARAM(0), LPARAM(0));
+        true.into()
+    }
     unsafe {
-        let _ = SendNotifyMessageW(HWND_BROADCAST, taskbar_created(), WPARAM(0), LPARAM(0));
+        let msg = taskbar_created();
+        let _ = EnumWindows(Some(send_each), LPARAM(msg as isize));
     }
 }
 

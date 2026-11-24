@@ -30,8 +30,6 @@ pub struct Config {
     pub downloads_stack: bool,
     /// The battery percentage next to the battery icon (off like macOS; still shown at 20% or less).
     pub battery_percent: bool,
-    /// macOS-style widgets on the desktop (clock, date, battery, system).
-    pub desktop_widgets: bool,
     /// macOS-style Alt+Tab: one icon per app in a frosted panel (replaces the Windows switcher).
     pub app_switcher: bool,
     /// Tapping the Windows key opens MacDock's Apps / Launchpad instead of the Start Menu.
@@ -124,7 +122,6 @@ impl Default for Config {
             recent: Vec::new(),
             show_recents: true,
             downloads_stack: true,
-            desktop_widgets: true,
             app_switcher: true,
             win_key_apps: true,
             win_search_spotlight: true,
@@ -165,7 +162,6 @@ impl Config {
         b("ShowRecents", &mut c.show_recents);
         b("DownloadsStack", &mut c.downloads_stack);
         b("BatteryPercent", &mut c.battery_percent);
-        b("DesktopWidgets", &mut c.desktop_widgets);
         b("AppSwitcher", &mut c.app_switcher);
         b("WinKeyApps", &mut c.win_key_apps);
         b("WinSearchSpotlight", &mut c.win_search_spotlight);
@@ -243,7 +239,6 @@ impl Config {
             "ShowRecents": self.show_recents,
             "DownloadsStack": self.downloads_stack,
             "BatteryPercent": self.battery_percent,
-            "DesktopWidgets": self.desktop_widgets,
             "AppSwitcher": self.app_switcher,
             "WinKeyApps": self.win_key_apps,
             "WinSearchSpotlight": self.win_search_spotlight,

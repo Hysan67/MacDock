@@ -25,8 +25,9 @@ use crate::{push, shell, Ev};
 // Rows of the strip mesh. The GPU draws each strip as two affine triangles, so few rows show as kinks in the
 // curved sides and a diagonal shear in the content; 128 keeps both under a pixel and still costs nothing.
 pub(crate) const ROWS: usize = 128;
-const MAX_SNAPS: usize = 4; // windows still on screen
-const MAX_MINIMIZED: usize = 4; // in memory (and SNAP_BYTES_MINIMIZED); older ones are read back from disk
+const MAX_SNAPS: usize = 8; // windows still on screen
+const MAX_MINIMIZED: usize = 6; // in memory (and SNAP_BYTES_MINIMIZED); older ones are read back from disk
+const TIMER_CAPTURE: usize = 1;
 const TIMER_PENDING: usize = 2;
 const TIMER_DISARM: usize = 3;
 const WM_CAPTURED: u32 = WM_APP + 5;
@@ -393,8 +394,8 @@ struct Snap {
 const SNAP_W: i32 = 2560;
 /// Memory for snapshots of minimized windows (newest first; older ones come back from disk) and for windows
 /// still on screen; the newest of each kind is always kept. About what 14 shrunk snapshots used to take.
-const SNAP_BYTES_MINIMIZED: usize = 12 << 20;
-const SNAP_BYTES_ON_SCREEN: usize = 8 << 20;
+const SNAP_BYTES_MINIMIZED: usize = 32 << 20;
+const SNAP_BYTES_ON_SCREEN: usize = 24 << 20;
 
 /// Copies a window's pixels straight off the screen (the window in front is what's visible there), shrunk to
 /// at most `max_w` px wide by GDI (HALFTONE) so no bigger bitmap is ever allocated.
@@ -786,6 +787,9 @@ impl Genie {
         set_min_animate(false);
         self.clean_persisted();
         start_mouse_hook();
+        unsafe {
+            SetTimer(self.hwnd, TIMER_CAPTURE, 6000, None);
+        }
     }
 
     pub fn stop(&mut self) {
@@ -810,7 +814,7 @@ impl Genie {
         self.paused = on;
         unsafe {
             if on {
-                let _ = KillTimer(self.hwnd, TIMER_PENDING);
+                let _ = KillTimer(self.hwnd, TIMER_CAPTURE);
                 stop_mouse_hook();
                 self.disarm();
                 self.snaps.retain(|&k, _| IsIconic(hwnd_of(k)).as_bool());
@@ -820,6 +824,7 @@ impl Genie {
                 self.gpu_tried = false;
             } else {
                 start_mouse_hook();
+                SetTimer(self.hwnd, TIMER_CAPTURE, 6000, None);
             }
         }
     }
@@ -1380,6 +1385,7 @@ impl Genie {
 
     pub fn handle(&mut self, e: GenieEv) {
         match e {
+            GenieEv::Timer(TIMER_CAPTURE) => self.capture(unsafe { GetForegroundWindow() }, false),
             GenieEv::Timer(TIMER_PENDING) => {
                 let now = Instant::now();
                 let fg = unsafe { GetForegroundWindow() }.0 as isize;

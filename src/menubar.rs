@@ -73,6 +73,7 @@ pub enum Extra {
     Tray,
     Battery,
     Wifi,
+    Bluetooth,
     ControlCenter,
     Calendar,
     Settings,
@@ -100,8 +101,6 @@ enum Item {
     Chevron,
     Battery,
     Net,
-    Apps,
-    Search,
     Cc,
     Clock,
 }
@@ -284,8 +283,6 @@ pub struct MenuBar {
     tray: bool,
     battery_pct: bool,
     surface: Option<Surface>,
-    pm_buf: Option<Pixmap>,      // reused scratch buffer to avoid ~1 MB alloc per hover
-    content_buf: Option<Pixmap>, // cached glyphs + shadow, rebuilt only when content changes
     dark_text: bool, // the wallpaper behind the bar is bright, so the content is drawn black
     slots: Vec<Slot>,
     hover: Option<usize>,
@@ -299,7 +296,6 @@ pub struct MenuBar {
     ticks: u32,
     tracking: bool,
     dirty: bool,
-    content_dirty: bool,
     pub auto_hide_dock: bool,
 }
 
@@ -310,16 +306,16 @@ impl MenuBar {
         let n = read_net();
         MenuBar {
             hwnd, shell: Shell::default(), dpi, screen_w: sw, screen_h: sh, appbar: false, hidden: false, tray, battery_pct,
-            surface: None, pm_buf: None, content_buf: None, dark_text: false, slots: Vec::new(), hover: None, open: None, target: HWND::default(),
+            surface: None, dark_text: false, slots: Vec::new(), hover: None, open: None, target: HWND::default(),
             app_name: "File Explorer".into(), names: HashMap::new(), clock: clock_text(), battery: b, net: n,
-            ticks: 0, tracking: false, dirty: true, content_dirty: true, auto_hide_dock: false,
+            ticks: 0, tracking: false, dirty: true, auto_hide_dock: false,
         }
     }
 
     pub fn start(&mut self) {
         self.load_frost();
         unsafe {
-            SetTimer(self.hwnd, TIMER_TICK, 2000, None);
+            SetTimer(self.hwnd, TIMER_TICK, 1000, None);
             let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
         }
         self.place();
@@ -346,10 +342,7 @@ impl MenuBar {
             let _ = SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, self.px(sw), self.px(H), SWP_NOACTIVATE);
         }
         self.surface = None;
-        self.pm_buf = None;
-        self.content_buf = None;
         self.dirty = true;
-        self.content_dirty = true;
         if !self.hidden {
             self.reserve();
         }
@@ -401,15 +394,11 @@ impl MenuBar {
             if on {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
                 let _ = KillTimer(self.hwnd, TIMER_TICK);
-                self.surface = None;
-                self.pm_buf = None;
-                self.content_buf = None;
             } else {
-                SetTimer(self.hwnd, TIMER_TICK, 2000, None);
+                SetTimer(self.hwnd, TIMER_TICK, 1000, None);
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
                 self.tick(true);
                 self.dirty = true;
-                self.content_dirty = true;
                 self.render();
             }
         }
@@ -451,32 +440,28 @@ impl MenuBar {
         if name != self.app_name {
             self.app_name = name;
             self.dirty = true;
-            self.content_dirty = true;
             self.render();
         }
     }
 
-    /// Clock and battery every 2 s; the network every 6 s.
+    /// Clock every second; battery too; the network every 5 s.
     fn tick(&mut self, all: bool) {
-        self.ticks = self.ticks.wrapping_add(1);
+        self.ticks += 1;
         let c = clock_text();
         if c != self.clock {
             self.clock = c;
             self.dirty = true;
-            self.content_dirty = true;
         }
         let b = power();
         if b != self.battery {
             self.battery = b;
             self.dirty = true;
-            self.content_dirty = true;
         }
-        if all || self.ticks % 3 == 1 {
+        if all || self.ticks % 5 == 1 {
             let n = read_net();
             if n != self.net {
                 self.net = n;
                 self.dirty = true;
-                self.content_dirty = true;
             }
         }
     }
@@ -548,7 +533,6 @@ impl MenuBar {
     /// Draw again from scratch (the interface language changed).
     pub fn redraw(&mut self) {
         self.dirty = true;
-        self.content_dirty = true;
         self.render();
     }
 
@@ -563,7 +547,6 @@ impl MenuBar {
         }
         *f = on;
         self.dirty = true;
-        self.content_dirty = true;
         self.render();
     }
 
@@ -571,7 +554,7 @@ impl MenuBar {
     pub fn set_open_extra(&mut self, e: Option<Extra>) {
         let want = e.and_then(|e| {
             self.slots.iter().position(|s| {
-                matches!((s.item, e), (Item::Chevron, Extra::Tray) | (Item::Battery, Extra::Battery) | (Item::Net, Extra::Wifi) | (Item::Cc, Extra::ControlCenter) | (Item::Clock, Extra::Calendar) | (Item::Apps, Extra::Launchpad) | (Item::Search, Extra::Spotlight))
+                matches!((s.item, e), (Item::Chevron, Extra::Tray) | (Item::Battery, Extra::Battery) | (Item::Net, Extra::Wifi) | (Item::Cc, Extra::ControlCenter | Extra::Bluetooth) | (Item::Clock, Extra::Calendar))
             })
         });
         if want != self.open {
@@ -587,11 +570,9 @@ impl MenuBar {
             Extra::Tray => Item::Chevron,
             Extra::Battery => Item::Battery,
             Extra::Wifi => Item::Net,
-            Extra::ControlCenter => Item::Cc,
+            Extra::Bluetooth | Extra::ControlCenter => Item::Cc,
             Extra::Calendar => Item::Clock,
-            Extra::Settings => Item::Logo,
-            Extra::Launchpad => Item::Apps,
-            Extra::Spotlight => Item::Search,
+            Extra::Settings | Extra::Launchpad | Extra::Spotlight => Item::Logo,
         };
         self.slots.iter().find(|s| s.item == item).map(|s| (self.px(s.x), self.px(s.x + s.w)))
     }
@@ -618,8 +599,6 @@ impl MenuBar {
             Item::Battery => return Some(BarAct::Flyout(Extra::Battery, r)),
             Item::Net => return Some(BarAct::Flyout(Extra::Wifi, r)),
             Item::Cc => return Some(BarAct::Flyout(Extra::ControlCenter, r)),
-            Item::Search => return Some(BarAct::Flyout(Extra::Spotlight, r)),
-            Item::Apps => return Some(BarAct::Flyout(Extra::Launchpad, r)),
             Item::Clock => return Some(BarAct::Flyout(Extra::Calendar, r)),
         }
     }
@@ -794,7 +773,6 @@ impl MenuBar {
                 *f = !*f;
                 let on = *f;
                 self.dirty = true;
-                self.content_dirty = true;
                 self.render();
                 return Some(BarAct::Option(o, on));
             }
@@ -839,8 +817,6 @@ impl MenuBar {
                 if t.is_empty() { 26.0 } else { self.text_w(&t, self.font(400)) + 6.0 + 26.0 }
             }
             Item::Net => 17.0,
-            Item::Search => self.text_w("\u{E721}", self.glyph_font(GLYPH_PX)),
-            Item::Apps => self.text_w("\u{F0E2}", self.glyph_font(GLYPH_PX)),
             Item::Cc => 17.0,
             Item::Clock => self.text_w(&self.clock, self.font(400)),
         }
@@ -861,7 +837,7 @@ impl MenuBar {
         if self.battery.is_some() {
             right.push(Item::Battery);
         }
-        right.extend([Item::Net, Item::Apps, Item::Search, Item::Cc, Item::Clock]);
+        right.extend([Item::Net, Item::Cc, Item::Clock]);
         let mut x = self.screen_w - SIDE;
         for it in right.into_iter().rev() {
             let w = self.content_w(it) + PAD_X * 2.0;
@@ -877,76 +853,17 @@ impl MenuBar {
             return;
         }
         self.dirty = false;
+        self.layout();
         let (w, h) = (self.px(self.screen_w).max(1) as u32, self.px(H).max(1) as u32);
         if self.surface.as_ref().is_none_or(|s| s.w != w || s.h != h) {
             self.surface = Surface::new(w, h);
-            self.pm_buf = None;
-            self.content_buf = None;
-            self.content_dirty = true;
         }
         let dpi = self.dpi as f32;
-
-        // Rebuild the text/icon + shadow layer only when content actually changed (NOT on hover).
-        if self.content_dirty || self.content_buf.is_none() {
-            self.content_dirty = false;
-            self.layout();
-            let mut content = Pixmap::new(w, h).unwrap();
-            for s in &self.slots {
-                let cx = (s.x + PAD_X) as f32 * dpi;
-                let mid = H as f32 / 2.0 * dpi;
-                match s.item {
-                    Item::Logo => draw_logo(&mut content, cx, mid, dpi),
-                    Item::App => self.draw_text(&mut content, &self.app_name, self.font(700), cx, mid),
-                    Item::Menu(m) => self.draw_text(&mut content, crate::i18n::t(m), self.font(500), cx, mid),
-                    Item::Chevron => self.draw_text(&mut content, "\u{E70E}", self.glyph_font(11.0), cx, mid),
-                    Item::Battery => {
-                        let t = self.battery_text();
-                        self.draw_text(&mut content, &t, self.font(400), cx, mid);
-                        let gx = if t.is_empty() { cx } else { cx + (self.text_w(&t, self.font(400)) as f32 + 6.0) * dpi };
-                        if let Some((pct, ac, charging)) = self.battery {
-                            draw_battery(&mut content, gx, mid - 6.25 * dpi + 1.0 * dpi, 26.0 * dpi, 12.5 * dpi, pct, ac, charging);
-                        }
-                    }
-                    Item::Net => match self.net {
-                        Net::Wired => self.draw_text(&mut content, "\u{E839}", self.glyph_font(GLYPH_PX), cx, mid),
-                        Net::Wifi(b) => draw_wifi(&mut content, cx, mid - 6.25 * dpi, 17.0 * dpi, 12.5 * dpi, b, false),
-                        Net::Off => draw_wifi(&mut content, cx, mid - 6.25 * dpi, 17.0 * dpi, 12.5 * dpi, 0, true),
-                    },
-                    Item::Search => self.draw_text(&mut content, "\u{E721}", self.glyph_font(GLYPH_PX), cx, mid),
-                    Item::Apps => self.draw_text(&mut content, "\u{F0E2}", self.glyph_font(GLYPH_PX), cx, mid),
-                    Item::Cc => draw_cc(&mut content, cx, mid, dpi),
-                    Item::Clock => self.draw_text(&mut content, &self.clock, self.font(400), cx, mid),
-                }
-            }
-            if self.dark_text {
-                for px in content.pixels_mut() {
-                    let (r, g, b) = (px.red(), px.green(), px.blue());
-                    if r.max(g).max(b) - r.min(g).min(b) < 24 {
-                        *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, px.alpha()).unwrap();
-                    }
-                }
-                self.content_buf = Some(content);
-            } else {
-                let mut layer = Pixmap::new(w, h).unwrap();
-                let mut shadow = content.clone();
-                for px in shadow.pixels_mut() {
-                    *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, (px.alpha() as u16 * 110 / 255) as u8).unwrap();
-                }
-                gfx::blur(&mut shadow, 2.0 * dpi);
-                layer.draw_pixmap(0, (0.5 * dpi).round() as i32, shadow.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
-                layer.draw_pixmap(0, 0, content.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
-                self.content_buf = Some(layer);
-            }
-        }
-
-        // Reuse the scratch buffer so hover changes allocate zero memory.
-        if self.pm_buf.as_ref().is_none_or(|p| p.width() != w || p.height() != h) {
-            self.pm_buf = Pixmap::new(w, h);
-        }
-        let Some(pm) = self.pm_buf.as_mut() else { return };
+        let mut pm = Pixmap::new(w, h).unwrap();
         // macOS 26: no bar at all, the content sits on the wallpaper. The bar's own pixels stay at alpha 1 so
         // the whole strip still takes clicks; hover / open highlights go on that layer, under the content.
         pm.fill(Color::from_rgba8(0, 0, 0, 1));
+        let mut content = Pixmap::new(w, h).unwrap();
         for (i, s) in self.slots.iter().enumerate() {
             let lit = if self.open == Some(i) { 0x40 } else if self.hover == Some(i) { 0x30 } else { 0 };
             if lit > 0 {
@@ -961,10 +878,48 @@ impl MenuBar {
                     pm.fill_path(&p, &paint, FillRule::Winding, Transform::identity(), None);
                 }
             }
+            let cx = (s.x + PAD_X) as f32 * dpi; // content left
+            let mid = H as f32 / 2.0 * dpi;
+            match s.item {
+                Item::Logo => draw_logo(&mut content, cx, mid, dpi),
+                Item::App => self.draw_text(&mut content, &self.app_name, self.font(700), cx, mid),
+                Item::Menu(m) => self.draw_text(&mut content, crate::i18n::t(m), self.font(500), cx, mid),
+                Item::Chevron => self.draw_text(&mut content, "\u{E70E}", self.glyph_font(11.0), cx, mid),
+                Item::Battery => {
+                    let t = self.battery_text();
+                    self.draw_text(&mut content, &t, self.font(400), cx, mid);
+                    let gx = if t.is_empty() { cx } else { cx + (self.text_w(&t, self.font(400)) as f32 + 6.0) * dpi };
+                    if let Some((pct, ac, charging)) = self.battery {
+                        draw_battery(&mut content, gx, mid - 6.25 * dpi + 1.0 * dpi, 26.0 * dpi, 12.5 * dpi, pct, ac, charging);
+                    }
+                }
+                Item::Net => match self.net {
+                    Net::Wired => self.draw_text(&mut content, "\u{E839}", self.glyph_font(GLYPH_PX), cx, mid),
+                    Net::Wifi(b) => draw_wifi(&mut content, cx, mid - 6.25 * dpi, 17.0 * dpi, 12.5 * dpi, b, false),
+                    Net::Off => draw_wifi(&mut content, cx, mid - 6.25 * dpi, 17.0 * dpi, 12.5 * dpi, 0, true),
+                },
+                Item::Cc => draw_cc(&mut content, cx, mid, dpi),
+                Item::Clock => self.draw_text(&mut content, &self.clock, self.font(400), cx, mid),
+            }
         }
-        if let Some(layer) = &self.content_buf {
-            gfx::over_sparse(pm.data_mut(), layer.data());
+        if self.dark_text {
+            // bright wallpaper: the white glyphs turn black (coloured ones, like a charging battery, stay)
+            for px in content.pixels_mut() {
+                let (r, g, b) = (px.red(), px.green(), px.blue());
+                if r.max(g).max(b) - r.min(g).min(b) < 24 {
+                    *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, px.alpha()).unwrap();
+                }
+            }
+        } else {
+            // dark wallpaper: white content with a soft shadow, like macOS
+            let mut shadow = content.clone();
+            for px in shadow.pixels_mut() {
+                *px = tiny_skia::PremultipliedColorU8::from_rgba(0, 0, 0, (px.alpha() as u16 * 110 / 255) as u8).unwrap();
+            }
+            gfx::blur(&mut shadow, 2.0 * dpi);
+            pm.draw_pixmap(0, (0.5 * dpi).round() as i32, shadow.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
         }
+        pm.draw_pixmap(0, 0, content.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
         if let Some(sf) = self.surface.as_mut() {
             // replace, not blend: the surface still holds the last frame
             let copy = PixmapPaint { blend_mode: tiny_skia::BlendMode::Source, ..Default::default() };
@@ -985,7 +940,6 @@ impl MenuBar {
             self.dark_text = n > 0 && sum / n as f64 / 255.0 > 0.62;
         }
         self.dirty = true;
-        self.content_dirty = true;
     }
 
     fn draw_text(&self, pm: &mut Pixmap, s: &str, f: Font, x: f32, mid: f32) {

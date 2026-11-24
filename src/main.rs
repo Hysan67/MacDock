@@ -4,6 +4,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod backdrop;
 mod badges;
 mod config;
 mod dock;
@@ -11,6 +12,7 @@ mod dropfiles;
 mod apps;
 mod spotlight;
 mod fly_battery;
+mod fly_bt;
 mod fly_cal;
 mod fly_cc;
 mod fly_settings;
@@ -32,7 +34,6 @@ mod sysctl;
 mod taskbar;
 mod tile;
 mod tray;
-mod widgets;
 mod winhook;
 
 use std::cell::RefCell;
@@ -108,8 +109,8 @@ struct App {
     /// the Settings window, which lives beside the drop-down flyouts
     win: Option<flyout::Flyout>,
     fullscreen: bool,
-    /// menu bar, widgets, Alt+Tab as this process started them (changing them needs a restart)
-    started: [bool; 3],
+    /// menu bar, Alt+Tab as this process started them (changing them needs a restart)
+    started: [bool; 2],
 }
 
 impl App {
@@ -129,8 +130,8 @@ impl App {
     /// is left. Put ours back on top of it while the desktop is up, and the widgets back down after.
     fn keep_over_desktop(&mut self, fg: HWND) {
         let up = is_desktop(fg) && desktop_raised();
-        unsafe {
-            if up {
+        if up {
+            unsafe {
                 let f = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
                 let _ = SetWindowPos(self.dock.hwnd, HWND_TOPMOST, 0, 0, 0, 0, f);
                 if let Some(b) = self.bar.as_ref() {
@@ -138,7 +139,6 @@ impl App {
                 }
             }
         }
-        widgets::set_raised(up);
     }
 
     /// Returns false to quit.
@@ -178,7 +178,6 @@ impl App {
             }
             winhook::set_paused(on);
             hud::set_paused(on);
-            widgets::set_paused(on);
             if let Some(b) = self.bar.as_mut() {
                 b.set_hidden(on);
             }
@@ -207,6 +206,7 @@ impl App {
         let content: Box<dyn flyout::Content> = match kind {
             menubar::Extra::Battery => Box::new(fly_battery::BatteryFly::new()),
             menubar::Extra::Wifi => Box::new(fly_wifi::WifiFly::new()),
+            menubar::Extra::Bluetooth => Box::new(fly_bt::BluetoothFly::new()),
             menubar::Extra::ControlCenter => Box::new(fly_cc::ControlCenter::new()),
             menubar::Extra::Tray => Box::new(fly_tray::TrayFly::new()),
             menubar::Extra::Calendar => Box::new(fly_cal::CalFly::new()),
@@ -425,6 +425,11 @@ impl App {
                                 self.toggle_flyout(menubar::Extra::Wifi, r);
                             }
                         }
+                        flyout::Cmd::OpenBluetooth => {
+                            if let Some((_, r)) = self.bar.as_ref().and_then(|b| b.extra_span(menubar::Extra::Bluetooth)) {
+                                self.toggle_flyout(menubar::Extra::Bluetooth, r);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -530,10 +535,14 @@ fn foreground_is_fullscreen() -> bool {
         if ["Progman", "WorkerW", "Shell_TrayWnd"].contains(&cls.as_str()) {
             return false;
         }
-        // anything with a title bar is not fullscreen, even when it covers the whole screen because no AppBar
-        // space is reserved; a fullscreen app sits exactly on the monitor without one. Not IsZoomed: Chrome and
-        // Edge keep WS_MAXIMIZE when a maximized window goes fullscreen (F11, YouTube), only the caption goes.
-        if GetWindowLongPtrW(fg, GWL_STYLE) & WS_CAPTION.0 as isize == WS_CAPTION.0 as isize {
+        // Anything with a title bar OR a maximized resizable window (e.g. VS Code / Electron custom
+        // titlebar apps) is NOT fullscreen. Real fullscreen apps (games, F11, video) remove WS_CAPTION
+        // and WS_THICKFRAME.
+        let style = GetWindowLongPtrW(fg, GWL_STYLE);
+        if style & WS_CAPTION.0 as isize == WS_CAPTION.0 as isize {
+            return false;
+        }
+        if IsZoomed(fg).as_bool() && (style & WS_THICKFRAME.0 as isize != 0) {
             return false;
         }
         let mut r = RECT::default();
@@ -609,19 +618,15 @@ Copy macdock.exe to a normal folder (for example %LOCALAPPDATA%\\Programs\\MacDo
     dropfiles::register(hwnd);
     let genie = cfg.genie.then(genie::Genie::new);
     let bar = cfg.menu_bar.then(|| menubar::MenuBar::new(menubar::create_window(), cfg.tray_icons, cfg.battery_percent));
-    let want_widgets = cfg.desktop_widgets;
     let want_switcher = cfg.app_switcher;
     let (win_apps, win_spot, media_hud) = (cfg.win_key_apps, cfg.win_search_spotlight, cfg.media_hud);
-    let started = [cfg.menu_bar, want_widgets, want_switcher];
+    let started = [cfg.menu_bar, want_switcher];
     let mut app = App { dock: Dock::new(hwnd, cfg), genie, bar, fly: None, win: None, fullscreen: false, started };
     app.apply_genie_timing();
     if let Some(b) = app.bar.as_mut() {
         b.start(); // reserve the top strip before the dock measures the work area
     }
     app.dock.start();
-    if want_widgets {
-        widgets::start(); // after the bar and dock reserved their strips, so the work area is final
-    }
     if want_switcher {
         switcher::start();
     }

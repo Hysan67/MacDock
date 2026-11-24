@@ -293,7 +293,7 @@ impl Content for ControlCenter {
                     }
                 });
             }
-            ID_BT_TEXT => return Cmd::Launch("ms-settings:bluetooth".into()),
+            ID_BT_TEXT => return Cmd::OpenBluetooth,
             ID_DARK => {
                 self.dark = !self.dark;
                 let d = self.dark;

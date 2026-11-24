@@ -23,7 +23,6 @@ pub enum Key {
     Badges,
     HideTaskbar,
     MenuBar,
-    Widgets,
     Switcher,
     WinKeyApps,
     WinSearchSpotlight,
@@ -109,7 +108,6 @@ pub fn apply(c: &mut Config, k: Key, v: f64) -> bool {
         Key::Badges => Some(&mut c.badges),
         Key::HideTaskbar => Some(&mut c.hide_taskbar),
         Key::MenuBar => Some(&mut c.menu_bar),
-        Key::Widgets => Some(&mut c.desktop_widgets),
         Key::Switcher => Some(&mut c.app_switcher),
         Key::WinKeyApps => Some(&mut c.win_key_apps),
         Key::WinSearchSpotlight => Some(&mut c.win_search_spotlight),
@@ -140,12 +138,12 @@ pub fn reset_animations(c: &mut Config) {
 
 /// Set up once at start: a change only takes effect after a restart.
 fn needs_restart(k: Key) -> bool {
-    matches!(k, Key::MenuBar | Key::Widgets | Key::Switcher)
+    matches!(k, Key::MenuBar | Key::Switcher)
 }
 
 /// The restart-only settings, in the order `Settings::started` keeps them.
-fn restart_state(c: &Config) -> [bool; 3] {
-    [c.menu_bar, c.desktop_widgets, c.app_switcher]
+fn restart_state(c: &Config) -> [bool; 2] {
+    [c.menu_bar, c.app_switcher]
 }
 
 enum Row {
@@ -194,7 +192,6 @@ fn desktop_rows() -> Vec<Row> {
         Row::Switch(Key::MenuBar, "Menu bar"),
         Row::Switch(Key::BatteryPct, "Battery percentage"),
         Row::Switch(Key::TrayIcons, "Tray icons in the menu bar"),
-        Row::Switch(Key::Widgets, "Desktop widgets"),
         Row::Switch(Key::Switcher, "Mac-style Alt+Tab"),
         Row::Switch(Key::WinKeyApps, "Win key opens Apps"),
         Row::Switch(Key::WinSearchSpotlight, "Win+S / Win+Q opens Spotlight"),
@@ -221,7 +218,7 @@ fn general_rows() -> Vec<Row> {
 pub struct Settings {
     cfg: Config,
     /// the restart-only settings as this process started with them
-    started: [bool; 3],
+    started: [bool; 2],
 }
 
 impl Settings {
@@ -230,7 +227,7 @@ impl Settings {
     }
 
     /// The restart-only settings this process is actually running with.
-    pub fn set_started(&mut self, started: [bool; 3]) {
+    pub fn set_started(&mut self, started: [bool; 2]) {
         self.started = started;
     }
 
@@ -258,7 +255,6 @@ impl Settings {
             Key::Badges => b(c.badges),
             Key::HideTaskbar => b(c.hide_taskbar),
             Key::MenuBar => b(c.menu_bar),
-            Key::Widgets => b(c.desktop_widgets),
             Key::Switcher => b(c.app_switcher),
             Key::WinKeyApps => b(c.win_key_apps),
             Key::WinSearchSpotlight => b(c.win_search_spotlight),
@@ -415,9 +411,9 @@ fn note_h(ui: &Ui, s: &str, w: f32) -> f32 {
     lines as f32 * ui.line_h(11.5, 400) + 16.0
 }
 
-const ALL: [Key; 25] = [
+const ALL: [Key; 24] = [
     Key::IconSize, Key::Magnify, Key::GlassVisibility, Key::AutoHide, Key::Recents, Key::Downloads, Key::Tiles, Key::Badges,
-    Key::HideTaskbar, Key::MenuBar, Key::Widgets, Key::Switcher, Key::WinKeyApps, Key::WinSearchSpotlight, Key::MediaHud, Key::BatteryPct,
+    Key::HideTaskbar, Key::MenuBar, Key::Switcher, Key::WinKeyApps, Key::WinSearchSpotlight, Key::MediaHud, Key::BatteryPct,
     Key::TrayIcons, Key::Genie, Key::GenieMs, Key::MagnifySpeed, Key::HideDelay, Key::HideSpeed, Key::ReduceMotion,
     Key::Language, Key::LaunchpadStyle,
 ];
@@ -520,7 +516,7 @@ impl Content for Settings {
         ry = self.group(ui, x, ry + 18.0, col, "General", &general_rows());
         ry += 16.0;
         let due = self.restart_due();
-        let msg = t(if due { "Restart MacDock to apply the menu bar, widgets and Alt+Tab changes." } else { "Changes apply right away and are saved to config.json." });
+        let msg = t(if due { "Restart MacDock to apply the menu bar and Alt+Tab changes." } else { "Changes apply right away and are saved to config.json." });
         ry += ui.text_wrap(x + 4.0, ry, msg, 11.5, 400, if due { white(0xD9) } else { white(0x80) }, col - 8.0) + 10.0;
         let bw = (col - 10.0) / 2.0;
         button(ui, ID_RESTART, x, ry, col, t("Restart MacDock"), due);

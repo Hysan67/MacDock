@@ -5,8 +5,6 @@
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
-use std::sync::OnceLock;
-use std::time::UNIX_EPOCH;
 
 use windows::core::{s, w};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -37,96 +35,54 @@ type Finalize = unsafe extern "C" fn(*mut c_void) -> c_int;
 type ColText = unsafe extern "C" fn(*mut c_void, c_int) -> *const c_char;
 type ColI64 = unsafe extern "C" fn(*mut c_void, c_int) -> i64;
 
-struct SqliteApi {
-    open: Open,
-    close: Close,
-    busy: Busy,
-    prepare: Prepare,
-    step: Step,
-    finalize: Finalize,
-    col_text: ColText,
-    col_i64: ColI64,
-}
-
-fn sqlite() -> Option<&'static SqliteApi> {
-    static API: OnceLock<Option<SqliteApi>> = OnceLock::new();
-    API.get_or_init(|| unsafe {
-        let lib = LoadLibraryW(w!("winsqlite3.dll")).ok()?;
-        macro_rules! f {
-            ($name:expr, $t:ty) => {
-                std::mem::transmute::<_, $t>(GetProcAddress(lib, $name)?)
-            };
-        }
-        Some(SqliteApi {
-            open: f!(s!("sqlite3_open_v2"), Open),
-            close: f!(s!("sqlite3_close"), Close),
-            busy: f!(s!("sqlite3_busy_timeout"), Busy),
-            prepare: f!(s!("sqlite3_prepare_v2"), Prepare),
-            step: f!(s!("sqlite3_step"), Step),
-            finalize: f!(s!("sqlite3_finalize"), Finalize),
-            col_text: f!(s!("sqlite3_column_text"), ColText),
-            col_i64: f!(s!("sqlite3_column_int64"), ColI64),
-        })
-    })
-    .as_ref()
-}
-
-fn db_path() -> &'static str {
-    static PATH: OnceLock<String> = OnceLock::new();
-    PATH.get_or_init(|| format!("{}\\Microsoft\\Windows\\Notifications\\wpndatabase.db", std::env::var("LOCALAPPDATA").unwrap_or_default()))
-}
-
-/// Fast metadata fingerprint of the Action Center notification database (+ WAL).
-/// Lets the caller skip spawning a worker and opening SQLite when nothing arrived.
-pub fn db_stamp() -> Option<(u64, u64)> {
-    let stat = |p: &str| -> (u64, u64) {
-        std::fs::metadata(p)
-            .ok()
-            .map(|m| {
-                let t = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as u64);
-                (t, m.len())
-            })
-            .unwrap_or((0, 0))
-    };
-    let a = stat(db_path());
-    if a == (0, 0) {
-        return None;
-    }
-    let b = stat(&format!("{}-wal", db_path()));
-    Some((a.0 ^ b.0.rotate_left(13), a.1 ^ b.1.rotate_left(7)))
-}
-
 /// App id (AUMID) and arrival time (FILETIME UTC) of every toast in the Action Center.
-/// winsqlite3.dll ships with Windows; loaded once at run time so the build needs no import library.
+/// winsqlite3.dll ships with Windows; loaded at run time so the build needs no import library.
 pub fn toasts() -> Vec<(String, i64)> {
     let mut list = Vec::new();
-    let p = db_path();
-    if !std::path::Path::new(p).exists() {
+    let db_path = format!("{}\\Microsoft\\Windows\\Notifications\\wpndatabase.db", std::env::var("LOCALAPPDATA").unwrap_or_default());
+    if !std::path::Path::new(&db_path).exists() {
         return list;
     }
-    let Some(api) = sqlite() else { return list };
     unsafe {
-        let Ok(path) = CString::new(p) else { return list };
+        let Ok(lib) = LoadLibraryW(w!("winsqlite3.dll")) else { return list };
+        macro_rules! f {
+            ($name:expr, $t:ty) => {
+                match GetProcAddress(lib, $name) {
+                    Some(p) => std::mem::transmute::<_, $t>(p),
+                    None => return list,
+                }
+            };
+        }
+        let open: Open = f!(s!("sqlite3_open_v2"), Open);
+        let close: Close = f!(s!("sqlite3_close"), Close);
+        let busy: Busy = f!(s!("sqlite3_busy_timeout"), Busy);
+        let prepare: Prepare = f!(s!("sqlite3_prepare_v2"), Prepare);
+        let step: Step = f!(s!("sqlite3_step"), Step);
+        let finalize: Finalize = f!(s!("sqlite3_finalize"), Finalize);
+        let col_text: ColText = f!(s!("sqlite3_column_text"), ColText);
+        let col_i64: ColI64 = f!(s!("sqlite3_column_int64"), ColI64);
+
+        let Ok(path) = CString::new(db_path) else { return list };
         let mut db = std::ptr::null_mut();
-        if (api.open)(path.as_ptr(), &mut db, 1 /* READONLY */, std::ptr::null()) != 0 {
+        if open(path.as_ptr(), &mut db, 1 /* READONLY */, std::ptr::null()) != 0 {
             if !db.is_null() {
-                (api.close)(db);
+                close(db);
             }
             return list;
         }
-        (api.busy)(db, 200);
+        busy(db, 200);
         let sql = CString::new("select h.PrimaryId, n.ArrivalTime from Notification n join NotificationHandler h on h.RecordId = n.HandlerId where n.Type = 'toast'").unwrap();
         let mut st = std::ptr::null_mut();
-        if (api.prepare)(db, sql.as_ptr(), -1, &mut st, std::ptr::null_mut()) == 0 {
-            while (api.step)(st) == 100 {
-                let t = (api.col_text)(st, 0);
+        if prepare(db, sql.as_ptr(), -1, &mut st, std::ptr::null_mut()) == 0 {
+            while step(st) == 100 {
+                let t = col_text(st, 0);
                 if !t.is_null() {
-                    list.push((CStr::from_ptr(t).to_string_lossy().into_owned(), (api.col_i64)(st, 1)));
+                    list.push((CStr::from_ptr(t).to_string_lossy().into_owned(), col_i64(st, 1)));
                 }
             }
-            (api.finalize)(st);
+            finalize(st);
         }
-        (api.close)(db);
+        close(db);
     }
     list
 }

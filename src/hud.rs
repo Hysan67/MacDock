@@ -333,46 +333,18 @@ pub fn start(enabled: bool) {
             });
         });
 
-        // Background brightness watcher keeping one \\.\LCD handle open (exits immediately on desktop monitors).
+        // Background brightness watcher using fast \\.\LCD ioctl (exits immediately on desktop monitors).
         std::thread::spawn(move || {
-            use windows::Win32::Foundation::{CloseHandle, GENERIC_READ};
-            use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
-            use windows::Win32::System::IO::DeviceIoControl;
-            const IOCTL_QUERY: u32 = 0x0023_0498;
-            let Ok(h) = CreateFileW(
-                w!("\\\\.\\LCD"),
-                GENERIC_READ.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_FLAGS_AND_ATTRIBUTES(0),
-                None,
-            ) else {
-                return;
-            };
-            let read_pct = |handle| -> Option<u8> {
-                let mut buf = [0u8; 3];
-                let mut returned = 0u32;
-                let ok = DeviceIoControl(handle, IOCTL_QUERY, None, 0, Some(buf.as_mut_ptr().cast()), 3, Some(&mut returned), None).is_ok();
-                if ok && returned >= 3 {
-                    Some((if buf[0] == 2 { buf[2] } else { buf[1] }).min(100))
-                } else {
-                    None
-                }
-            };
-            let Some(mut last) = read_pct(h) else {
-                let _ = CloseHandle(h);
-                return;
-            };
+            let Some(mut last) = sysctl::brightness_fast() else { return };
             loop {
-                std::thread::sleep(Duration::from_millis(250));
+                std::thread::sleep(Duration::from_millis(160));
                 if !ENABLED.load(Ordering::Relaxed) || PAUSED.load(Ordering::Relaxed) {
-                    if let Some(cur) = read_pct(h) {
+                    if let Some(cur) = sysctl::brightness_fast() {
                         last = cur;
                     }
                     continue;
                 }
-                if let Some(cur) = read_pct(h) {
+                if let Some(cur) = sysctl::brightness_fast() {
                     if cur != last {
                         last = cur;
                         let target = HWND_HUD.load(Ordering::Relaxed);
